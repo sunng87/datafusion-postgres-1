@@ -2,20 +2,30 @@
 //!
 //! * `pg_client_encoding()` — name of the current client encoding. DataFusion
 //!   only handles UTF-8, so this always returns `'UTF8'`.
-//! * `to_ascii(text [, encoding])` — convert text to ASCII by transliterating
-//!   Latin accented characters to their ASCII base.
+//! * `to_ascii(text [, encoding])` — convert text to ASCII using Postgres'
+//!   own ISO 8859-1 → ASCII transliteration table.
 //!
 //! <https://www.postgresql.org/docs/current/functions-string.html>
 //!
 //! ## Postgres compatibility
 //!
-//! `to_ascii` transliterates accented Latin characters (the Latin-1 Supplement
-//! range, plus the common Latin Extended-A letters) to their ASCII base — e.g.
-//! `'café' → 'cafe'`, `'München' → 'Munchen'`, `ß → 'ss'` — matching the intent
-//! of Postgres' `to_ascii(..., 'LATIN1')`. Any character that cannot be
-//! transliterated is omitted. The optional `encoding` argument is accepted for
-//! signature compatibility but ignored (input is always UTF-8); Postgres would
-//! error on UTF-8 input without an explicit LATIN-family encoding.
+//! The table below is Postgres' actual LATIN1 → ASCII mapping, extracted
+//! verbatim from a live PostgreSQL 18 server (byte range 0x80–0xFF). It is
+//! intentionally idiosyncratic — e.g. `ß` → `B` (not `ss`), `Æ` → `A` (not
+//! `AE`), `©` → `C`, `£` → `L` — because Postgres maps every single-byte
+//! character to a *single* ASCII character and replaces unmapped characters
+//! with a space. General transliteration libraries (`any_ascii`, `deunicode`)
+//! produce different mappings (e.g. `ß` → `ss`) and therefore cannot be used.
+//!
+//! Deviations from Postgres, documented:
+//!
+//! * Postgres only accepts `to_ascii` when the (server or given) encoding is
+//!   a single-byte LATIN-family encoding; on a UTF-8 database the one-argument
+//!   form raises an error. We always transliterate with the LATIN1 table and
+//!   accept (and ignore) the optional `encoding` argument.
+//! * Postgres' LATIN2–LATIN10 / WIN850 tables are not implemented; characters
+//!   outside the LATIN1 range (U+0080–U+00FF) map to a space, matching
+//!   Postgres' unmapped-character behavior.
 
 use std::sync::Arc;
 
@@ -128,158 +138,55 @@ impl ScalarUDFImpl for ToAsciiUDF {
     }
 }
 
-/// Transliterate a string to ASCII. Latin-1 Supplement and Latin Extended-A
-/// letters are mapped to their ASCII base; unmappable characters are dropped.
+/// Transliterate a string to ASCII using Postgres' LATIN1 table: ASCII
+/// passes through, U+0080–U+00FF map through `LATIN1_TO_ASCII`, and every
+/// other character maps to a space (Postgres' unmapped-character behavior).
 fn to_ascii_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        match transliterate(c) {
-            Some(mapped) => out.push_str(mapped),
-            None => out.push(c),
+        let u = c as u32;
+        if u < 0x80 {
+            out.push(c);
+        } else if (0x80..=0xFF).contains(&u) {
+            // Index into the table (u - 0x80); unmapped entries are ' '.
+            out.push(LATIN1_TO_ASCII[(u - 0x80) as usize]);
+        } else {
+            // Outside the LATIN1 range: Postgres' unmapped behavior.
+            out.push(' ');
         }
     }
     out
 }
 
-/// Return the ASCII transliteration of a Latin-range character, or `None` if
-/// the character is already ASCII (kept as-is) or has no mapping (dropped).
-fn transliterate(c: char) -> Option<&'static str> {
-    let u = c as u32;
-    // Already-ASCII characters pass through unchanged.
-    if u < 0x80 {
-        return None;
-    }
-    // Latin-1 Supplement (U+00C0 .. U+00FF) transliteration.
-    let mapped = match u {
-        0x00C0 => "A",
-        0x00C1 => "A",
-        0x00C2 => "A",
-        0x00C3 => "A",
-        0x00C4 => "A",
-        0x00C5 => "A",
-        0x00C6 => "AE",
-        0x00C7 => "C",
-        0x00C8 => "E",
-        0x00C9 => "E",
-        0x00CA => "E",
-        0x00CB => "E",
-        0x00CC => "I",
-        0x00CD => "I",
-        0x00CE => "I",
-        0x00CF => "I",
-        0x00D0 => "D",
-        0x00D1 => "N",
-        0x00D2 => "O",
-        0x00D3 => "O",
-        0x00D4 => "O",
-        0x00D5 => "O",
-        0x00D6 => "O",
-        0x00D8 => "O",
-        0x00D9 => "U",
-        0x00DA => "U",
-        0x00DB => "U",
-        0x00DC => "U",
-        0x00DD => "Y",
-        0x00DE => "TH",
-        0x00DF => "ss",
-        0x00E0 => "a",
-        0x00E1 => "a",
-        0x00E2 => "a",
-        0x00E3 => "a",
-        0x00E4 => "a",
-        0x00E5 => "a",
-        0x00E6 => "ae",
-        0x00E7 => "c",
-        0x00E8 => "e",
-        0x00E9 => "e",
-        0x00EA => "e",
-        0x00EB => "e",
-        0x00EC => "i",
-        0x00ED => "i",
-        0x00EE => "i",
-        0x00EF => "i",
-        0x00F0 => "d",
-        0x00F1 => "n",
-        0x00F2 => "o",
-        0x00F3 => "o",
-        0x00F4 => "o",
-        0x00F5 => "o",
-        0x00F6 => "o",
-        0x00F8 => "o",
-        0x00F9 => "u",
-        0x00FA => "u",
-        0x00FB => "u",
-        0x00FC => "u",
-        0x00FD => "y",
-        0x00FE => "th",
-        0x00FF => "y",
-        // Latin Extended-A (common Central/Eastern European letters).
-        0x0100 | 0x0101 => "A",  // Ā/ā
-        0x0102 | 0x0103 => "A",  // Ă/ă
-        0x0104 | 0x0105 => "A",  // Ą/ą
-        0x0106 | 0x0107 => "C",  // Ć/ć
-        0x0108 | 0x0109 => "C",  // Ĉ/ĉ
-        0x010A | 0x010B => "C",  // Ċ/ċ
-        0x010C | 0x010D => "C",  // Č/č
-        0x010E | 0x010F => "D",  // Ď/ď
-        0x0110 | 0x0111 => "D",  // Đ/đ
-        0x0112 | 0x0113 => "E",  // Ē/ē
-        0x0114 | 0x0115 => "E",  // Ĕ/ĕ
-        0x0116 | 0x0117 => "E",  // Ė/ė
-        0x0118 | 0x0119 => "E",  // Ę/ę
-        0x011A | 0x011B => "E",  // Ě/ě
-        0x011C | 0x011D => "G",  // Ĝ/ĝ
-        0x011E | 0x011F => "G",  // Ğ/ğ
-        0x0120 | 0x0121 => "G",  // Ġ/ġ
-        0x0122 | 0x0123 => "G",  // Ģ/ģ
-        0x0124 | 0x0125 => "H",  // Ĥ/ĥ
-        0x0126 | 0x0127 => "H",  // Ħ/ħ
-        0x0128 | 0x0129 => "I",  // Ĩ/ĩ
-        0x012A | 0x012B => "I",  // Ī/ī
-        0x012C | 0x012D => "I",  // Ĭ/ĭ
-        0x012E | 0x012F => "I",  // Į/į
-        0x0130 => "I",           // İ
-        0x0134 | 0x0135 => "J",  // Ĵ/ĵ
-        0x0136 | 0x0137 => "K",  // Ķ/ķ
-        0x0139 | 0x013A => "L",  // Ĺ/ĺ
-        0x013B | 0x013C => "L",  // Ļ/ļ
-        0x013D | 0x013E => "L",  // Ľ/ľ
-        0x0141 | 0x0142 => "L",  // Ł/ł
-        0x0143 | 0x0144 => "N",  // Ń/ń
-        0x0145 | 0x0146 => "N",  // Ņ/ņ
-        0x0147 | 0x0148 => "N",  // Ň/ň
-        0x014A | 0x014B => "NG", // Ŋ/ŋ
-        0x014C | 0x014D => "O",  // Ō/ō
-        0x014E | 0x014F => "O",  // Ŏ/ŏ
-        0x0150 | 0x0151 => "O",  // Ő/ő
-        0x0152 => "OE",          // Œ
-        0x0153 => "oe",          // œ
-        0x0154 | 0x0155 => "R",  // Ŕ/ŕ
-        0x0156 | 0x0157 => "R",  // Ŗ/ŗ
-        0x0158 | 0x0159 => "R",  // Ř/ř
-        0x015A | 0x015B => "S",  // Ś/ś
-        0x015C | 0x015D => "S",  // Ŝ/ŝ
-        0x015E | 0x015F => "S",  // Ş/ş
-        0x0160 | 0x0161 => "S",  // Š/š
-        0x0162 | 0x0163 => "T",  // Ţ/ţ
-        0x0164 | 0x0165 => "T",  // Ť/ť
-        0x0166 | 0x0167 => "T",  // Ŧ/ŧ
-        0x0168 | 0x0169 => "U",  // Ũ/ũ
-        0x016A | 0x016B => "U",  // Ū/ū
-        0x016C | 0x016D => "U",  // Ŭ/ŭ
-        0x016E | 0x016F => "U",  // Ů/ů
-        0x0170 | 0x0171 => "U",  // Ű/ű
-        0x0172 | 0x0173 => "U",  // Ų/ų
-        0x0174 | 0x0175 => "W",  // Ŵ/ŵ
-        0x0176 | 0x0177 => "Y",  // Ŷ/ŷ
-        0x0178 => "Y",           // Ÿ
-        0x0179 | 0x017A => "Z",  // Ź/ź
-        0x017B | 0x017C => "Z",  // Ż/ż
-        0x017D | 0x017E => "Z",  // Ž/ž
-        _ => return None,
-    };
-    Some(mapped)
-}
+/// Postgres' ISO 8859-1 (LATIN1) → ASCII table for bytes 0x80–0xFF, extracted
+/// verbatim from PostgreSQL 18.4 (`to_ascii` in a LATIN1 database). Entries
+/// marked `' '` are unmapped by Postgres and replaced with a space.
+const LATIN1_TO_ASCII: [char; 128] = [
+    // 0x80 – 0x8F: C1 controls — unmapped
+    ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ',
+    // 0x90 – 0x9F: C1 controls — unmapped
+    ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ', ' ',
+    // 0xA0 nbsp, 0xA1 ¡, 0xA2 ¢, 0xA3 £, 0xA4 ¤, 0xA5 ¥, 0xA6 ¦, 0xA7 §
+    ' ', ' ', 'c', 'L', ' ', 'Y', ' ', ' ',
+    // 0xA8 ¨, 0xA9 ©, 0xAA ª, 0xAB «, 0xAC ¬, 0xAD ­, 0xAE ®, 0xAF ¯
+    '"', 'C', 'a', ' ', ' ', '-', 'R', ' ',
+    // 0xB0 °, 0xB1 ±, 0xB2 ², 0xB3 ³, 0xB4 ´, 0xB5 µ, 0xB6 ¶, 0xB7 ·
+    ' ', ' ', ' ', ' ', '\'', 'u', ' ', '.',
+    // 0xB8 ¸, 0xB9 ¹, 0xBA º, 0xBB », 0xBC ¼, 0xBD ½, 0xBE ¾, 0xBF ¿
+    ',', ' ', ' ', ' ', ' ', ' ', ' ', '?', // 0xC0–0xC6 À Å Æ, 0xC7 Ç
+    'A', 'A', 'A', 'A', 'A', 'A', 'A', 'C', // 0xC8–0xCB È Ë, 0xCC–0xCF Ì Ï
+    'E', 'E', 'E', 'E', 'I', 'I', 'I', 'I',
+    // 0xD0 Ð — unmapped, 0xD1 Ñ, 0xD2–0xD6 Ò Ö, 0xD7 ×
+    ' ', 'N', 'O', 'O', 'O', 'O', 'O', 'x',
+    // 0xD8 Ø, 0xD9–0xDC Ù Ü, 0xDD Ý, 0xDE Þ, 0xDF ß
+    'O', 'U', 'U', 'U', 'U', 'Y', 'T', 'B', // 0xE0–0xE6 à æ, 0xE7 ç
+    'a', 'a', 'a', 'a', 'a', 'a', 'a', 'c', // 0xE8–0xEB è ë, 0xEC–0xEF ì ï
+    'e', 'e', 'e', 'e', 'i', 'i', 'i', 'i',
+    // 0xF0 ð — unmapped, 0xF1 ñ, 0xF2–0xF6 ò ö, 0xF7 ÷
+    ' ', 'n', 'o', 'o', 'o', 'o', 'o', '/',
+    // 0xF8 ø, 0xF9–0xFC ù ü, 0xFD ý, 0xFE þ, 0xFF ÿ
+    'o', 'u', 'u', 'u', 'u', 'y', 't', 'y',
+];
 
 pub fn create_pg_client_encoding_udf() -> ScalarUDF {
     ScalarUDF::new_from_impl(PgClientEncodingUDF::default())
@@ -317,11 +224,12 @@ mod tests {
         );
     }
 
+    /// Every expectation below was verified against PostgreSQL 18.4.
     #[tokio::test]
-    async fn to_ascii_transliterates() {
+    async fn to_ascii_matches_postgres() {
         let ctx = SessionContext::new();
         ctx.register_udf(create_to_ascii_udf());
-        // Accented Latin chars are transliterated to their ASCII base (not '?').
+        // Accented letters fold to their base letter.
         assert_eq!(
             run_str(&ctx, "SELECT to_ascii('café')").await,
             Some("cafe".into())
@@ -330,9 +238,73 @@ mod tests {
             run_str(&ctx, "SELECT to_ascii('München')").await,
             Some("Munchen".into())
         );
+        // Idiosyncratic-but-real Postgres mappings.
         assert_eq!(
-            run_str(&ctx, "SELECT to_ascii('hello')").await,
-            Some("hello".into())
+            run_str(&ctx, "SELECT to_ascii('ß')").await,
+            Some("B".into())
+        );
+        assert_eq!(
+            run_str(&ctx, "SELECT to_ascii('Æ')").await,
+            Some("A".into())
+        );
+        assert_eq!(
+            run_str(&ctx, "SELECT to_ascii('æ')").await,
+            Some("a".into())
+        );
+        assert_eq!(
+            run_str(&ctx, "SELECT to_ascii('Þ')").await,
+            Some("T".into())
+        );
+        assert_eq!(
+            run_str(&ctx, "SELECT to_ascii('þ')").await,
+            Some("t".into())
+        );
+        // Symbols.
+        assert_eq!(
+            run_str(&ctx, "SELECT to_ascii('©')").await,
+            Some("C".into())
+        );
+        assert_eq!(
+            run_str(&ctx, "SELECT to_ascii('£')").await,
+            Some("L".into())
+        );
+        assert_eq!(
+            run_str(&ctx, "SELECT to_ascii('¥')").await,
+            Some("Y".into())
+        );
+        assert_eq!(
+            run_str(&ctx, "SELECT to_ascii('×')").await,
+            Some("x".into())
+        );
+        assert_eq!(
+            run_str(&ctx, "SELECT to_ascii('÷')").await,
+            Some("/".into())
+        );
+        assert_eq!(
+            run_str(&ctx, "SELECT to_ascii('µ')").await,
+            Some("u".into())
+        );
+        assert_eq!(
+            run_str(&ctx, "SELECT to_ascii('¿')").await,
+            Some("?".into())
+        );
+        // Unmapped characters become a space (Postgres behavior).
+        assert_eq!(
+            run_str(&ctx, "SELECT to_ascii('°')").await,
+            Some(" ".into())
+        );
+        assert_eq!(
+            run_str(&ctx, "SELECT to_ascii('¼')").await,
+            Some(" ".into())
+        );
+        assert_eq!(
+            run_str(&ctx, "SELECT to_ascii('Ð')").await,
+            Some(" ".into())
+        );
+        // Outside the LATIN1 range: unmapped behavior (space).
+        assert_eq!(
+            run_str(&ctx, "SELECT to_ascii('ā')").await,
+            Some(" ".into())
         );
         assert_eq!(
             run_str(&ctx, "SELECT to_ascii(CAST(NULL AS TEXT))").await,

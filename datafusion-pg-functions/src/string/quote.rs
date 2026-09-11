@@ -4,12 +4,12 @@
 //!
 //! ## Postgres compatibility
 //!
-//! Both functions render their argument as a single-quoted SQL string literal,
-//! with embedded single quotes doubled. Backslashes are **not** doubled:
-//! PostgreSQL ships with `standard_conforming_strings = on` by default, in
-//! which a backslash inside `'...'` is an ordinary character and needs no
-//! escaping. (Only the legacy `off` setting, or the `E'...'` form, doubles
-//! backslashes — neither of which DataFusion models.)
+//! Both functions render their argument as an SQL string literal, doubling
+//! embedded single quotes. When the value contains a backslash, Postgres
+//! emits the `E'...'` escape-string form with **both** single quotes and
+//! backslashes doubled (verified on PostgreSQL 18 with the default
+//! `standard_conforming_strings = on`): `quote_literal('a\b')` → `E'a\\b'`.
+//! Values without backslashes get the plain `'...'` form.
 //!
 //! `quote_nullable` differs from `quote_literal` only on `NULL` input: it
 //! returns the unquoted string `NULL` rather than a null value.
@@ -24,20 +24,17 @@ use datafusion::logical_expr::{
     Volatility,
 };
 
-/// Render `s` as a single-quoted SQL literal, doubling embedded single quotes.
-/// Backslashes are left untouched (standard_conforming_strings = on).
+/// Render `s` as an SQL literal. If `s` contains a backslash, Postgres emits
+/// the `E'...'` form with single quotes and backslashes doubled; otherwise
+/// the plain `'...'` form with single quotes doubled.
+/// (Both behaviors verified against PostgreSQL 18.)
 fn pg_quote_literal(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for ch in s.chars() {
-        if ch == '\'' {
-            out.push_str("''");
-        } else {
-            out.push(ch);
-        }
+    let quotes_doubled = s.replace('\'', "''");
+    if s.contains('\\') {
+        format!("E'{}'", quotes_doubled.replace('\\', "\\\\"))
+    } else {
+        format!("'{quotes_doubled}'")
     }
-    out.push('\'');
-    out
 }
 
 // ---------------------------------------------------------------------------
@@ -191,6 +188,7 @@ mod tests {
 
     #[tokio::test]
     async fn quote_literal_basics() {
+        // Expectations verified against PostgreSQL 18.4.
         let ctx = SessionContext::new();
         ctx.register_udf(create_quote_literal_udf());
 
@@ -198,10 +196,19 @@ mod tests {
             run_str(&ctx, "SELECT quote_literal('hello')").await,
             Some("'hello'".into())
         );
-        // Embedded single quote is doubled; backslash is NOT doubled (scs=on).
+        // Embedded single quote doubled; no backslash -> plain form.
+        assert_eq!(
+            run_str(&ctx, "SELECT quote_literal('a''b')").await,
+            Some("'a''b'".into())
+        );
+        // Backslash present -> E'...' form with quotes AND backslashes doubled.
         assert_eq!(
             run_str(&ctx, "SELECT quote_literal('a''b\\c')").await,
-            Some("'a''b\\c'".into())
+            Some("E'a''b\\\\c'".into())
+        );
+        assert_eq!(
+            run_str(&ctx, "SELECT quote_literal('plain\\slash')").await,
+            Some("E'plain\\\\slash'".into())
         );
         assert_eq!(
             run_str(&ctx, "SELECT quote_literal(CAST(NULL AS TEXT))").await,
@@ -222,6 +229,11 @@ mod tests {
         assert_eq!(
             run_str(&ctx, "SELECT quote_nullable(CAST(NULL AS TEXT))").await,
             Some("NULL".into())
+        );
+        // Backslash -> E'' form, same rule as quote_literal.
+        assert_eq!(
+            run_str(&ctx, "SELECT quote_nullable('a\\b')").await,
+            Some("E'a\\\\b'".into())
         );
     }
 

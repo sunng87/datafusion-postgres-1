@@ -10,11 +10,12 @@
 //!
 //! ## Postgres compatibility
 //!
-//! `casefold` performs full Unicode case folding (CaseFolding.txt, the common
-//! `C` plus full `F` mappings) via the ICU4X case-mapping tables — the same
-//! operation Postgres performs. It is *not* the same as locale-independent
-//! lowercase: it expands e.g. `ß` → `ss`, folds the long-s `ſ` → `s`, maps
-//! final sigma `ς` → `σ`, micro `µ` → `μ`, and capital sharp-s `ẞ` → `ss`.
+//! `casefold` applies **simple, per-character Unicode lowercasing** —
+//! verified against PostgreSQL 18: `casefold('ß')` → `'ß'` (Postgres does
+//! NOT expand to `ss`), `casefold('İ')` → `'i'` (no combining dot — the
+//! UnicodeData *simple* mapping), and final sigma is not context-sensitive
+//! (`casefold('ΟΔΟΣ')` → `'οδοσ'`). This matches Postgres exactly; it is
+//! neither full case folding nor Rust's `to_lowercase` (which expands `İ`).
 //!
 //! `unicode_assigned` reports whether every codepoint has a non-`Cn` general
 //! category, looked up via the ICU4X property tables — so Private-Use-Area
@@ -121,10 +122,17 @@ impl ScalarUDFImpl for NormalizeUDF {
 // casefold(text) → text — full Unicode case folding
 // ---------------------------------------------------------------------------
 
-/// Apply full Unicode case folding (CaseFolding.txt `C` + `F` mappings) via
-/// the ICU4X `CaseMapper` — the same tables Postgres' own casefold uses.
+/// Apply Postgres' `casefold`: simple, per-character Unicode lowercasing via
+/// the ICU4X `CaseMapper::simple_lowercase` — verified equal to PostgreSQL
+/// 18's `casefold()`/`lower()` on every tested character, including `ß`→`ß`,
+/// `İ`→`i`, `ẞ`→`ß`, and non-contextual final sigma.
 fn casefold_str(s: &str) -> String {
-    CaseMapper::new().fold_string(s).into_owned()
+    let cm = CaseMapper::new();
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        out.push(cm.simple_lowercase(c));
+    }
+    out
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -258,87 +266,64 @@ impl ScalarUDFImpl for UnicodeAssignedUDF {
 // unistr(text) → text
 // ---------------------------------------------------------------------------
 
-/// Decode `\uXXXX`, `\UXXXXXXXX`, and `\+XXXXXX` Unicode escapes. A backslash
-/// not introducing a recognized escape is kept verbatim.
+/// Decode Postgres' Unicode escapes: `\XXXX` (bare, exactly 4 hex digits),
+/// `\uXXXX`, `\+XXXXXX` (exactly 6), and `\UXXXXXXXX` (exactly 8).
+/// Verified against PostgreSQL 18: any other backslash sequence — including
+/// `\n`, `\\` and short `\+` forms — is an error, not a pass-through.
 fn decode_unistr(s: &str) -> Result<String> {
+    fn push_codepoint(out: &mut String, hex: &str) -> Result<()> {
+        let cp = u32::from_str_radix(hex, 16).map_err(|_| {
+            DataFusionError::Execution(format!("unistr: invalid hex escape \\{hex}"))
+        })?;
+        let c = char::from_u32(cp).ok_or_else(|| {
+            DataFusionError::Execution(format!("unistr: invalid Unicode codepoint U+{cp:04X}"))
+        })?;
+        out.push(c);
+        Ok(())
+    }
+
+    /// Consume exactly `n` hex digits from `chars`; error if fewer.
+    fn take_hex<I: Iterator<Item = char>>(chars: &mut I, n: usize) -> Result<String> {
+        let mut hex = String::with_capacity(n);
+        for _ in 0..n {
+            match chars.next() {
+                Some(c) if c.is_ascii_hexdigit() => hex.push(c),
+                other => {
+                    return Err(DataFusionError::Execution(format!(
+                        "unistr: invalid Unicode escape (expected {n} hex digits, \
+                         got {hex:?} then {other:?}); escapes must be \\XXXX, \
+                         \\+XXXXXX, \\uXXXX, or \\UXXXXXXXX"
+                    )));
+                }
+            }
+        }
+        Ok(hex)
+    }
+
     let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
+    let mut chars = s.chars();
     while let Some(ch) = chars.next() {
         if ch != '\\' {
             out.push(ch);
             continue;
         }
-        match chars.peek() {
-            Some('u') => {
-                chars.next();
-                let hex: String = chars.by_ref().take(4).collect();
-                if hex.len() != 4 {
-                    return Err(DataFusionError::Execution(format!(
-                        "unistr: incomplete \\u escape (got {hex:?})"
-                    )));
-                }
-                let cp = u32::from_str_radix(&hex, 16).map_err(|_| {
-                    DataFusionError::Execution(format!(
-                        "unistr: invalid hex in \\u escape: \\u{hex}"
-                    ))
-                })?;
-                let c = char::from_u32(cp).ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "unistr: invalid Unicode codepoint U+{cp:04X}"
-                    ))
-                })?;
-                out.push(c);
+        match chars.next() {
+            Some('u') => push_codepoint(&mut out, &take_hex(&mut chars, 4)?)?,
+            Some('U') => push_codepoint(&mut out, &take_hex(&mut chars, 8)?)?,
+            Some('+') => push_codepoint(&mut out, &take_hex(&mut chars, 6)?)?,
+            Some(c) if c.is_ascii_hexdigit() => {
+                // Bare \XXXX form: the digit just read is the first of four.
+                let mut hex = String::with_capacity(4);
+                hex.push(c);
+                hex.push_str(&take_hex(&mut chars, 3)?);
+                push_codepoint(&mut out, &hex)?;
             }
-            Some('U') => {
-                chars.next();
-                let hex: String = chars.by_ref().take(8).collect();
-                if hex.len() != 8 {
-                    return Err(DataFusionError::Execution(format!(
-                        "unistr: incomplete \\U escape (got {hex:?})"
-                    )));
-                }
-                let cp = u32::from_str_radix(&hex, 16).map_err(|_| {
-                    DataFusionError::Execution(format!(
-                        "unistr: invalid hex in \\U escape: \\U{hex}"
-                    ))
-                })?;
-                let c = char::from_u32(cp).ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "unistr: invalid Unicode codepoint U+{cp:08X}"
-                    ))
-                })?;
-                out.push(c);
+            other => {
+                return Err(DataFusionError::Execution(format!(
+                    "unistr: invalid Unicode escape \\{other:?}; escapes must be \
+                     \\XXXX, \\+XXXXXX, \\uXXXX, or \\UXXXXXXXX"
+                )));
             }
-            Some('+') => {
-                chars.next();
-                let mut hex = String::new();
-                for _ in 0..6 {
-                    match chars.peek() {
-                        Some(c) if c.is_ascii_hexdigit() => {
-                            hex.push(*c);
-                            chars.next();
-                        }
-                        _ => break,
-                    }
-                }
-                if hex.is_empty() {
-                    return Err(DataFusionError::Execution(
-                        "unistr: \\+ escape requires at least one hex digit".into(),
-                    ));
-                }
-                let cp = u32::from_str_radix(&hex, 16).map_err(|_| {
-                    DataFusionError::Execution(format!(
-                        "unistr: invalid hex in \\+ escape: \\+{hex}"
-                    ))
-                })?;
-                let c = char::from_u32(cp).ok_or_else(|| {
-                    DataFusionError::Execution(format!(
-                        "unistr: invalid Unicode codepoint U+{cp:04X}"
-                    ))
-                })?;
-                out.push(c);
-            }
-            _ => out.push('\\'),
         }
     }
     Ok(out)
@@ -468,38 +453,47 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn casefold_full_folding() {
+    async fn casefold_matches_postgres() {
+        // Every expectation verified against PostgreSQL 18.4:
+        // casefold = simple per-char lowercase (NOT full case folding).
         let ctx = SessionContext::new();
         ctx.register_udf(create_casefold_udf());
         assert_eq!(
             run_str(&ctx, "SELECT casefold('Hello World')").await,
             Some("hello world".into())
         );
-        // Full case folding: ß -> ss (not ß), long-s ſ -> s.
-        assert_eq!(
-            run_str(&ctx, "SELECT casefold('STRASSE')").await,
-            Some("strasse".into())
-        );
+        // ß is NOT expanded to ss (Postgres: casefold('ß') = 'ß').
         assert_eq!(
             run_str(&ctx, "SELECT casefold('ß')").await,
-            Some("ss".into())
+            Some("ß".into())
         );
+        // Long-s and final sigma stay as-is (simple per-char mapping).
         assert_eq!(
             run_str(&ctx, "SELECT casefold('ſ')").await,
-            Some("s".into())
+            Some("ſ".into())
         );
-        // Full case folding edge cases: final sigma, micro sign, capital sharp-s.
         assert_eq!(
             run_str(&ctx, "SELECT casefold('ς')").await,
-            Some("σ".into())
+            Some("ς".into())
+        );
+        // Capital sharp-s and micro sign.
+        assert_eq!(
+            run_str(&ctx, "SELECT casefold('ẞ')").await,
+            Some("ß".into())
         );
         assert_eq!(
             run_str(&ctx, "SELECT casefold('µ')").await,
-            Some("μ".into())
+            Some("µ".into())
         );
+        // Dotted capital I: simple mapping to 'i' (Rust to_lowercase would add U+0307).
         assert_eq!(
-            run_str(&ctx, "SELECT casefold('ẞ')").await,
-            Some("ss".into())
+            run_str(&ctx, "SELECT casefold('İ')").await,
+            Some("i".into())
+        );
+        // Final sigma is NOT context-sensitive.
+        assert_eq!(
+            run_str(&ctx, "SELECT casefold('ΟΔΟΣ')").await,
+            Some("οδοσ".into())
         );
         assert_eq!(
             run_str(&ctx, "SELECT casefold(CAST(NULL AS TEXT))").await,
@@ -529,6 +523,7 @@ mod tests {
 
     #[tokio::test]
     async fn unistr_escapes() {
+        // Semantics verified against PostgreSQL 18.4.
         let ctx = SessionContext::new();
         ctx.register_udf(create_unistr_udf());
         assert_eq!(
@@ -539,6 +534,16 @@ mod tests {
             run_str(&ctx, r"SELECT unistr('\U00000041')").await,
             Some("A".into())
         );
+        // Bare \XXXX form (no marker letter).
+        assert_eq!(
+            run_str(&ctx, "SELECT unistr('a\\0062c')").await,
+            Some("abc".into())
+        );
+        // \+ requires EXACTLY 6 hex digits.
+        assert_eq!(
+            run_str(&ctx, "SELECT unistr('x\\+000061y')").await,
+            Some("xay".into())
+        );
         assert_eq!(
             run_str(&ctx, "SELECT unistr('hello')").await,
             Some("hello".into())
@@ -547,6 +552,17 @@ mod tests {
             run_str(&ctx, "SELECT unistr(CAST(NULL AS TEXT))").await,
             None
         );
+
+        // Invalid escapes are errors, not pass-throughs (Postgres behavior):
+        // \n, \\, and a short \+ form all error.
+        for bad in [
+            "SELECT unistr('a\\nb')",
+            "SELECT unistr('a\\\\b')",
+            "SELECT unistr('x\\+0061y')",
+        ] {
+            let res = ctx.sql(bad).await.unwrap().collect().await;
+            assert!(res.is_err(), "unistr should reject {bad}");
+        }
     }
 
     #[tokio::test]
@@ -562,7 +578,7 @@ mod tests {
             .unwrap();
         let arr = df[0].column(0).as_string::<i32>();
         assert_eq!(arr.value(0), "a");
-        assert_eq!(arr.value(1), "ss");
+        assert_eq!(arr.value(1), "ß");
         assert!(arr.is_null(2));
     }
 }

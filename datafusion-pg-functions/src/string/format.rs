@@ -4,22 +4,26 @@
 //!
 //! ## Postgres compatibility
 //!
-//! Implements the documented `format()` grammar exactly:
-//! `format(formatstr text [, VARIADIC "any"])` with specifiers
+//! Implements `format()`'s grammar as of PostgreSQL 18, verified against a
+//! live 18.4 server: `format(formatstr text [, VARIADIC "any"])` with
+//! specifiers
 //!
-//! * `%[position]s` — format the argument as a simple string (NULL → empty).
-//! * `%[position]I` — format the argument as an SQL identifier, double-quoted
-//!   unless it is a bare identifier (lowercase ASCII letters/digits/underscore,
-//!   not starting with a digit). Deviation from Postgres: the reserved-word
-//!   check is not implemented, so `format('%I', 'select')` renders unquoted
-//!   where Postgres would quote it.
-//! * `%[position]L` — format the argument as an SQL literal (`quote_nullable`).
+//! * `%[position][flags][width]s` — format the argument as a simple string
+//!   (NULL → empty).
+//! * `%[position][flags][width]I` — format the argument as an SQL identifier
+//!   (double-quoted unless bare; reserved words are not checked — see below).
+//! * `%[position][flags][width]L` — format the argument as an SQL literal
+//!   (`quote_nullable`).
 //! * `%%` — a literal `%`.
 //!
-//! `[position]` is `N$` for the 1-based argument index. When omitted, the next
-//! automatic argument is consumed. Width/precision/flags are **not** part of
-//! Postgres' grammar and are rejected with an error. `sprintf` (PG 18+) is an
-//! alias of `format`.
+//! `[position]` is `N$` (1-based argument index; when omitted the next
+//! automatic argument is consumed). `[flags]` is `-` (left-justify).
+//! `[width]` is either digits (a leading `0` is part of the number — there is
+//! no zero-fill flag) or `*`, which consumes the next automatic argument as
+//! the width (negative width left-justifies, as in C `printf`).
+//!
+//! `sprintf` is an alias of `format` (it appears upstream after PG 18; the
+//! catalog lists it as 🚧 there, so exposing it early is harmless).
 
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::{DataFusionError, Result, ScalarValue};
@@ -79,6 +83,15 @@ fn pg_format(fmt: &str, args: &[Option<String>]) -> Result<String> {
     let mut chars = fmt.chars().peekable();
     let mut auto_idx: usize = 0;
 
+    // Consume the next automatic argument (for values and `*` widths).
+    macro_rules! next_auto {
+        () => {{
+            let i = auto_idx;
+            auto_idx += 1;
+            args.get(i).cloned()
+        }};
+    }
+
     while let Some(ch) = chars.next() {
         if ch != '%' {
             out.push(ch);
@@ -91,7 +104,8 @@ fn pg_format(fmt: &str, args: &[Option<String>]) -> Result<String> {
             continue;
         }
 
-        // Optional positional index: digits followed by '$'.
+        // Optional positional index: digits followed by '$'. Digits not
+        // followed by '$' are a width specifier.
         let mut pos_idx: Option<usize> = None;
         let mut digit_buf = String::new();
         while let Some(&c) = chars.peek() {
@@ -102,29 +116,64 @@ fn pg_format(fmt: &str, args: &[Option<String>]) -> Result<String> {
                 break;
             }
         }
+        if !digit_buf.is_empty() && chars.peek() == Some(&'$') {
+            chars.next();
+            let n: usize = digit_buf.parse().map_err(|_| {
+                DataFusionError::Execution(format!(
+                    "format: invalid positional index '{digit_buf}'"
+                ))
+            })?;
+            if n == 0 {
+                return Err(DataFusionError::Execution(
+                    "format: positional index must be >= 1".into(),
+                ));
+            }
+            pos_idx = Some(n - 1);
+            digit_buf.clear();
+        }
+
+        // Flags: '-' (left-justify); repeated '-' is allowed.
+        let mut left_align = false;
+        while chars.peek() == Some(&'-') {
+            chars.next();
+            left_align = true;
+        }
+
+        // Width: the digits gathered above, fresh digits, or '*'.
+        let mut width: Option<usize> = None;
         if !digit_buf.is_empty() {
-            if chars.peek() == Some(&'$') {
+            width = Some(digit_buf.parse().unwrap_or(0));
+        } else {
+            let mut w = String::new();
+            while let Some(&c) = chars.peek() {
+                if c.is_ascii_digit() {
+                    w.push(c);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            if !w.is_empty() {
+                width = Some(w.parse().unwrap_or(0));
+            } else if chars.peek() == Some(&'*') {
                 chars.next();
-                let n: usize = digit_buf.parse().map_err(|_| {
+                let warg = next_auto!().ok_or_else(|| {
+                    DataFusionError::Execution("format: '*' width requires an argument".into())
+                })?;
+                let wv = warg.ok_or_else(|| {
+                    DataFusionError::Execution("format: '*' width argument must not be NULL".into())
+                })?;
+                let wn: i64 = wv.parse().map_err(|_| {
                     DataFusionError::Execution(format!(
-                        "format: invalid positional index '{digit_buf}'"
+                        "format: '*' width must be an integer, got {wv:?}"
                     ))
                 })?;
-                if n == 0 {
-                    return Err(DataFusionError::Execution(
-                        "format: positional index must be >= 1".into(),
-                    ));
+                if wn < 0 {
+                    left_align = true;
+                    width = Some(wn.unsigned_abs() as usize);
+                } else {
+                    width = Some(wn as usize);
                 }
-                pos_idx = Some(n - 1);
-            } else {
-                // Postgres' grammar has no width/precision: digits that are not
-                // part of an `N$` position are not a valid specifier.
-                let consumed = chars.next();
-                return Err(DataFusionError::Execution(format!(
-                    "format: unrecognized format specifier '%{digit_buf}{}' \
-                     (width/flags are not supported)",
-                    consumed.unwrap_or_default()
-                )));
             }
         }
 
@@ -143,7 +192,24 @@ fn pg_format(fmt: &str, args: &[Option<String>]) -> Result<String> {
                 args.len()
             ))
         })?;
-        out.push_str(&format_spec(spec, val.as_ref())?);
+        let formatted = format_spec(spec, val.as_ref())?;
+        match width {
+            Some(w) if w > formatted.chars().count() => {
+                let pad = w - formatted.chars().count();
+                if left_align {
+                    out.push_str(&formatted);
+                    for _ in 0..pad {
+                        out.push(' ');
+                    }
+                } else {
+                    for _ in 0..pad {
+                        out.push(' ');
+                    }
+                    out.push_str(&formatted);
+                }
+            }
+            _ => out.push_str(&formatted),
+        }
     }
     Ok(out)
 }
@@ -262,18 +328,63 @@ mod tests {
         );
     }
 
+    /// Width/flag/'*' behavior verified against PostgreSQL 18.4.
     #[tokio::test]
-    async fn format_rejects_width() {
-        // Postgres' format() grammar has no width — an error at execution, not planning.
+    async fn format_width_flags_star() {
+        let ctx = SessionContext::new();
+        ctx.register_udf(create_format_udf());
+        // Right-aligned width 10; a leading 0 is part of the width, not a flag.
+        assert_eq!(
+            run_str(&ctx, "SELECT format('[%10s]', 'x')").await,
+            Some("[         x]".into())
+        );
+        assert_eq!(
+            run_str(&ctx, "SELECT format('[%010s]', 'x')").await,
+            Some("[         x]".into())
+        );
+        // Left-justify with '-'.
+        assert_eq!(
+            run_str(&ctx, "SELECT format('[%-10s]', 'x')").await,
+            Some("[x         ]".into())
+        );
+        // Dynamic width with '*'.
+        assert_eq!(
+            run_str(&ctx, "SELECT format('[%*s]', 5, 'x')").await,
+            Some("[    x]".into())
+        );
+        // Position + width.
+        assert_eq!(
+            run_str(&ctx, "SELECT format('[%1$10s]', 'x')").await,
+            Some("[         x]".into())
+        );
+        // Width applies to %I after quoting.
+        assert_eq!(
+            run_str(&ctx, "SELECT format('[%10I]', 'tbl')").await,
+            Some("[       tbl]".into())
+        );
+        // Width applies to %L after quoting.
+        assert_eq!(
+            run_str(&ctx, "SELECT format('[%5L]', 'ab')").await,
+            Some("[ 'ab']".into())
+        );
+        // Overlong values are not truncated.
+        assert_eq!(
+            run_str(&ctx, "SELECT format('[%2s]','abc')").await,
+            Some("[abc]".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn format_rejects_unknown_specifier() {
         let ctx = SessionContext::new();
         ctx.register_udf(create_format_udf());
         let res = ctx
-            .sql("SELECT format('%10s', 'x')")
+            .sql("SELECT format('%d', 1)")
             .await
             .unwrap()
             .collect()
             .await;
-        assert!(res.is_err(), "width should be rejected");
+        assert!(res.is_err(), "%d should be rejected (only %s, %I, %L)");
     }
 
     #[tokio::test]

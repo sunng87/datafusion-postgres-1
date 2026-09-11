@@ -69,7 +69,7 @@ NULL
 query T
 SELECT quote_literal('a''b\c')
 ----
-'a''b\c'
+E'a''b\\c'
 
 query T
 SELECT quote_literal(CAST(NULL AS TEXT))
@@ -121,7 +121,7 @@ upper
 query T
 SELECT casefold('ß')
 ----
-ss
+ß
 
 query T
 SELECT casefold(CAST(NULL AS TEXT))
@@ -190,6 +190,27 @@ SELECT sprintf('Hello, %s!', 'world')
 ----
 Hello, world!
 
+query T
+SELECT format('[%10s]', 'x')
+----
+[         x]
+
+query T
+SELECT format('[%-10s]', 'x')
+----
+[x         ]
+
+query T
+SELECT format('[%*s]', 5, 'x')
+----
+[    x]
+
+# unistr bare \XXXX form (PG-verified)
+query T
+SELECT unistr('a\0062c')
+----
+abc
+
 # ============================================================================
 # regexp_substr(text, pattern [, ...]) -- extract regex match
 # ============================================================================
@@ -242,6 +263,23 @@ SELECT to_ascii('München')
 ----
 Munchen
 
+query T
+SELECT to_ascii('ß')
+----
+B
+
+query T
+SELECT to_ascii('Æ')
+----
+A
+
+query T
+SELECT to_ascii('©£¥×÷µ¿')
+----
+CLYx/u?
+
+# (Unmapped characters -> space is covered by unit tests; whitespace-only
+#  rows are fragile in slt record format.)
 query T
 SELECT to_ascii(CAST(NULL AS TEXT))
 ----
